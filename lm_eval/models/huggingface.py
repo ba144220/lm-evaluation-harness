@@ -4,6 +4,7 @@ import os
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
+import inspect
 
 import jinja2
 import torch
@@ -38,6 +39,7 @@ from lm_eval.models.utils import (
     stop_sequences_criteria,
 )
 
+from hf_prefix_caching import PrefixCache
 
 if TYPE_CHECKING:
     from transformers.quantizers import AutoQuantizationConfig
@@ -99,6 +101,14 @@ class HFLM(TemplateLM):
         # end token for thinking, either the string or int token id.
         # splits to get response after this token (if provided).
         think_end_token: Union[str, int, None] = None,
+
+        # prefix caching
+        use_prefix_caching: Optional[bool] = False,
+        prefix_cache_block_size: Optional[int] = 64,
+        prefix_cache_max_block_length: Optional[int] = 40,
+        prefix_cache_max_num_blocks: Optional[int] = 256,
+        prefix_cache_max_new_blocks: Optional[int] = 10,
+
         **kwargs,
     ) -> None:
         super().__init__()
@@ -324,6 +334,51 @@ class HFLM(TemplateLM):
             eval_logger.info(
                 f"Loglikelihood prefix token id used in evaluation: {self.prefix_token_id}"
             )
+
+        # prefix caching
+        self.use_prefix_caching = use_prefix_caching
+        self.prefix_cache_block_size = prefix_cache_block_size
+        self.prefix_cache_max_block_length = prefix_cache_max_block_length
+        self.prefix_cache_max_num_blocks = prefix_cache_max_num_blocks
+        self.prefix_cache_max_new_blocks = prefix_cache_max_new_blocks
+        self.prefix_cache: Optional[PrefixCache] = None
+
+        # prepare prefix caching
+        if self.use_prefix_caching:
+            self.prefix_cache = self._prepare_prefix_caching()
+
+
+    def _prepare_prefix_caching(self) -> Optional[PrefixCache]:
+        # Check if tokenizer is left-padding
+        if self.tokenizer.padding_side == "left":
+            eval_logger.warning(
+                "Prefix caching is not supported for left-padding tokenizers. "
+                "Please use a right-padding tokenizer."
+            )
+            self.use_prefix_caching = False
+            return None
+
+        # Check if `model.forward()` method has `past_key_values` and `use_cache` argument
+        forward_signature = inspect.signature(self.model.forward)
+        if "past_key_values" not in forward_signature.parameters or "use_cache" not in forward_signature.parameters:
+            eval_logger.warning(
+                "`model.forward()` method does not have `past_key_values` and `use_cache` arguments. "
+                "Prefix caching is not supported."
+            )
+            self.use_prefix_caching = False
+            return None
+
+        # Create prefix cache
+        eval_logger.info("Initializing prefix cache...")
+        prefix_cache = PrefixCache(
+            block_size=self.prefix_cache_block_size,
+            padding_side=self.tokenizer.padding_side,
+            max_block_length=self.prefix_cache_max_block_length,
+            max_num_blocks=self.prefix_cache_max_num_blocks,
+            max_new_blocks=self.prefix_cache_max_new_blocks,
+        )
+        eval_logger.info("Prefix cache initialized.")
+        return prefix_cache
 
     def _get_accelerate_args(
         self,
@@ -917,6 +972,18 @@ class HFLM(TemplateLM):
             A torch tensor of shape [batch, sequence, vocab] with the
         logits returned from the model's decoder
         """
+        if self.prefix_cache is not None:
+            kv_cache = self.prefix_cache.get(inps)
+            hit_length = kv_cache.get_seq_length()
+            input_ids = inps[:, hit_length:]
+            call_kwargs = {
+                "past_key_values": kv_cache,
+                "use_cache": True,
+            }
+        else:
+            kv_cache = None
+            input_ids = inps
+            call_kwargs = {}
         with torch.no_grad():
             with torch.autocast(
                 device_type=self.device.type,
@@ -926,15 +993,23 @@ class HFLM(TemplateLM):
                 if attn_mask is not None or labels is not None:
                     assert attn_mask is not None and labels is not None
                     assert self.AUTO_MODEL_CLASS == transformers.AutoModelForSeq2SeqLM
-                    return self.model(
-                        input_ids=inps, attention_mask=attn_mask, labels=labels
+                    logits = self.model(
+                        input_ids=input_ids, attention_mask=attn_mask, labels=labels
                     ).logits
                 else:
                     assert self.AUTO_MODEL_CLASS in (
                         transformers.AutoModelForCausalLM,
                         transformers.AutoModelForVision2Seq,
                     )
-                    return self.model(inps).logits
+
+                    outputs = self.model(
+                        input_ids,
+                        **call_kwargs,
+                    )
+                    logits = outputs.logits
+                    if self.prefix_cache is not None and outputs.past_key_values is not None:
+                        self.prefix_cache.update(inps, outputs.past_key_values)
+        return logits
 
     def _model_generate(self, context, max_length, stop, **generation_kwargs):
         # temperature = 0.0 if not set
