@@ -376,7 +376,13 @@ class TemplateLM(LM):
         self, requests: list["Instance"], disable_tqdm: bool = False
     ) -> list[tuple[float, bool]]:
         new_reqs = []
-        for context, continuation in [req.args for req in requests]:
+        pbar = tqdm(
+            requests,
+            desc="Tokenizing loglikelihood requests",
+            disable=disable_tqdm,
+        )
+        for req in pbar:
+            context, continuation = req.args
             if context == "":
                 # BOS or EOS as context
                 context_enc, continuation_enc = (
