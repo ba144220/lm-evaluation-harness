@@ -63,7 +63,7 @@ def simple_evaluate(
     bootstrap_iters: int = 100000,
     check_integrity: bool = False,
     write_out: bool = False,
-    log_samples: bool = True,
+    log_samples: bool = False,
     evaluation_tracker: Optional[EvaluationTracker] = None,
     system_instruction: Optional[str] = None,
     apply_chat_template: Union[bool, str] = False,

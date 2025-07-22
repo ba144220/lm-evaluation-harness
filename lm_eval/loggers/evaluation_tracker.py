@@ -67,6 +67,8 @@ class GeneralConfigTracker:
     @staticmethod
     def _get_model_name(model_args: str) -> str:
         """Extracts the model name from the model arguments."""
+        if model_args is None:
+            return ""
 
         def extract_model_name(model_args: str, key: str) -> str:
             """Extracts the model name from the model arguments using a key."""
